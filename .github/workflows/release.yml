@@ -1,0 +1,206 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release ${{ github.ref }}
+          draft: false
+          prerelease: false
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+
+  build-and-upload:
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            suffix: linux-amd64
+            strip: true
+
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            suffix: linux-arm64
+            strip: true
+
+          - os: macos-latest
+            target: x86_64-apple-darwin
+            suffix: darwin-amd64
+            strip: true
+
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            suffix: darwin-arm64
+            strip: true
+
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            suffix: windows-amd64.exe
+            strip: false
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          target: ${{ matrix.target }}
+          override: true
+
+      - name: Install cross-compilation tools (Linux ARM)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        uses: actions-rs/cargo@v1
+        with:
+          command: build
+          args: --release --target ${{ matrix.target }}
+
+      - name: Strip binary (Unix)
+        if: matrix.strip
+        run: |
+          if [ "${{ matrix.os }}" = "ubuntu-latest" ]; then
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              aarch64-linux-gnu-strip target/${{ matrix.target }}/release/serve
+            else
+              strip target/${{ matrix.target }}/release/serve
+            fi
+          else
+            strip target/${{ matrix.target }}/release/serve
+          fi
+        shell: bash
+
+      - name: Prepare binary
+        id: prepare_binary
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/serve.exe serve-${{ matrix.suffix }}
+          else
+            cp target/${{ matrix.target }}/release/serve serve-${{ matrix.suffix }}
+          fi
+
+          # Generate SHA256 checksum
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            certutil -hashfile serve-${{ matrix.suffix }} SHA256 | grep -v "^SHA256" | tr -d " \t\n\r" > serve-${{ matrix.suffix }}.sha256
+          else
+            shasum -a 256 serve-${{ matrix.suffix }} | cut -d ' ' -f 1 > serve-${{ matrix.suffix }}.sha256
+          fi
+        shell: bash
+
+      - name: Upload binary to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./serve-${{ matrix.suffix }}
+          asset_name: serve-${{ matrix.suffix }}
+          asset_content_type: application/octet-stream
+
+      - name: Upload checksum to release
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./serve-${{ matrix.suffix }}.sha256
+          asset_name: serve-${{ matrix.suffix }}.sha256
+          asset_content_type: text/plain
+
+  update-homebrew:
+    needs: [create-release, build-and-upload]
+    runs-on: macos-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Set up environment variables
+        id: vars
+        run: |
+          echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+          echo "repo_owner=${GITHUB_REPOSITORY_OWNER}" >> $GITHUB_OUTPUT
+
+      - name: Get macOS AMD64 binary SHA
+        id: macos_amd64_sha
+        run: |
+          curl -sL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/serve-darwin-amd64.sha256 -o macos_amd64.sha256
+          echo "sha=$(cat macos_amd64.sha256)" >> $GITHUB_OUTPUT
+
+      - name: Get macOS ARM64 binary SHA
+        id: macos_arm64_sha
+        run: |
+          curl -sL https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/serve-darwin-arm64.sha256 -o macos_arm64.sha256
+          echo "sha=$(cat macos_arm64.sha256)" >> $GITHUB_OUTPUT
+
+      - name: Create Homebrew formula
+        env:
+          HOMEBREW_GITHUB_API_TOKEN: ${{ secrets.HOMEBREW_GITHUB_TOKEN }}
+        run: |
+          cat > serve.rb << EOF
+          class Serve < Formula
+            desc "Simple file server with a modern UI"
+            homepage "https://github.com/${{ github.repository }}"
+            version "${{ steps.vars.outputs.version }}"
+
+            on_macos do
+              on_arm do
+                url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/serve-darwin-arm64"
+                sha256 "${{ steps.macos_arm64_sha.outputs.sha }}"
+              end
+
+              on_intel do
+                url "https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/serve-darwin-amd64"
+                sha256 "${{ steps.macos_amd64_sha.outputs.sha }}"
+              end
+            end
+
+            def install
+              bin.install Dir["serve-*"].first => "serve"
+            end
+
+            test do
+              system "#{bin}/serve", "--version"
+            end
+          end
+          EOF
+
+          if [ ! -d homebrew-serve ]; then
+            git clone https://github.com/${{ steps.vars.outputs.repo_owner }}/homebrew-serve.git || (
+              # If repo doesn't exist, create it
+              mkdir homebrew-serve
+              cd homebrew-serve
+              git init
+              git config --global user.name "GitHub Actions"
+              git config --global user.email "actions@github.com"
+              git remote add origin https://x-access-token:${{ secrets.HOMEBREW_GITHUB_TOKEN }}@github.com/${{ steps.vars.outputs.repo_owner }}/homebrew-serve.git
+              cd ..
+            )
+          fi
+
+          cp serve.rb homebrew-serve/Formula/serve.rb
+          cd homebrew-serve
+          git add Formula/serve.rb
+          git commit -m "Update serve to ${{ steps.vars.outputs.version }}"
+          git push -u origin main || git push -u origin master
