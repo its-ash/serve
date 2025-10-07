@@ -57,3 +57,8 @@ yarn-error.log*
 *.bak
 *.backup
 *~
+# macOS custom folder icon file with special character at the end
+Icon[[:cntrl:]]
+# Alternative ways to match the Icon file
+Icon?
+Icon^M
